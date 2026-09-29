@@ -1,0 +1,3 @@
+# Valfritt: bara för ENRICH_WITH_CRAWL4AI=true
+# Efter installationen, kör en gång: crawl4ai-setup  (laddar ner webbläsaren)
+crawl4ai>=0.8
