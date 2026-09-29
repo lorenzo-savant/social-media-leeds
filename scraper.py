@@ -1,17 +1,19 @@
 """
-Cerca post di lavoro per "statist" / "skådespelare" su LinkedIn, X/Twitter,
-Instagram e Facebook, SOLO dell'ultimo mese, ed esporta i risultati in
-CSV + Excel con le stesse colonne del vecchio foglio Google:
-Platform | Title | URL | Snippet
+Söker efter jobbinlägg om "statist" / "skådespelare" på LinkedIn, X/Twitter,
+Instagram och Facebook, ENDAST från den senaste månaden, och exporterar
+resultaten till CSV + Excel med samma kolumner som det gamla Google-arket:
+Platform | Title | URL | Snippet | Date
 
-Backend supportati (scegli con SEARCH_BACKEND nel file .env):
-  - serper  -> https://serper.dev (risultati Google, 2.500 query gratis)
-  - google  -> Google Custom Search JSON API (solo se hai già una chiave:
-               chiusa ai nuovi clienti, smette di funzionare il 1/1/2027)
+Sökbackends som stöds (välj med SEARCH_BACKEND i .env-filen):
+  - serper  -> https://serper.dev (Google-resultat, 2 500 gratis sökningar)
+  - google  -> Google Custom Search JSON API (endast om du redan har en nyckel:
+               stängd för nya kunder, slutar fungera 2027-01-01)
 """
 
 import csv
 import os
+import re
+import sys
 import time
 from datetime import datetime
 
@@ -22,9 +24,14 @@ from openpyxl.styles import Font
 
 load_dotenv()
 
-# ---------------------------------------------------------------- CONFIG
-BACKEND = os.getenv("SEARCH_BACKEND", "serper").lower()
-PAGES_PER_QUERY = int(os.getenv("PAGES_PER_QUERY", "3"))  # 10 risultati/pagina
+# Windows-terminaler använder ibland cp1252: tvinga UTF-8 så att å ä ö och
+# emojis inte kraschar utskriften (t.ex. vid omdirigering till en loggfil).
+for stream in (sys.stdout, sys.stderr):
+    stream.reconfigure(encoding="utf-8", errors="replace")
+
+# ---------------------------------------------------------------- INSTÄLLNINGAR
+BACKEND = os.getenv("SEARCH_BACKEND", "serper").strip().lower()
+PAGES_PER_QUERY = int(os.getenv("PAGES_PER_QUERY", "3"))  # 10 resultat/sida
 
 KEYWORDS = [
     "statist",
@@ -41,10 +48,20 @@ PLATFORMS = {
     "Facebook": "site:facebook.com",
 }
 
-# Parole che il risultato DEVE contenere (titolo o snippet) per essere tenuto.
-# Lascia la lista vuota per non filtrare.
-MUST_CONTAIN_ANY = ["statist", "skådespelar", "casting", "söker", "sökes", "extra"]
-# ------------------------------------------------------------------------
+# Ett resultat behålls bara om titeln eller utdraget matchar minst ett av
+# mönstren. Hela ord, så att "statist" INTE träffar "statistik"/"statistiker".
+# Lämna listan tom för att inte filtrera alls.
+MUST_MATCH_ANY = [
+    r"\bstatist(er|erna|en|jobb\w*)?\b",
+    r"\bskådespel\w*",
+    r"\bcasting\w*",
+    r"\bsöker\b",
+    r"\bsökes\b",
+    r"\bextras?\b",
+]
+# ------------------------------------------------------------------------------
+
+RELEVANT_RE = [re.compile(p, re.IGNORECASE) for p in MUST_MATCH_ANY]
 
 
 def search_serper(query: str, page: int) -> list[dict]:
@@ -54,9 +71,9 @@ def search_serper(query: str, page: int) -> list[dict]:
                  "Content-Type": "application/json"},
         json={
             "q": query,
-            "gl": "se",          # risultati dalla Svezia
-            "hl": "sv",          # lingua svedese
-            "tbs": "qdr:m",      # <-- SOLO ULTIMO MESE
+            "gl": "se",          # resultat från Sverige
+            "hl": "sv",          # svenska
+            "tbs": "qdr:m",      # <-- ENDAST SENASTE MÅNADEN
             "num": 10,
             "page": page,
         },
@@ -79,7 +96,7 @@ def search_google_cse(query: str, page: int) -> list[dict]:
             "q": query,
             "gl": "se",
             "lr": "lang_sv",
-            "dateRestrict": "m1",   # <-- SOLO ULTIMO MESE
+            "dateRestrict": "m1",   # <-- ENDAST SENASTE MÅNADEN
             "num": 10,
             "start": (page - 1) * 10 + 1,
         },
@@ -93,29 +110,47 @@ def search_google_cse(query: str, page: int) -> list[dict]:
     ]
 
 
-SEARCH = {"serper": search_serper, "google": search_google_cse}[BACKEND]
+BACKENDS = {
+    "serper": (search_serper, ["SERPER_API_KEY"]),
+    "google": (search_google_cse, ["GOOGLE_API_KEY", "GOOGLE_CX"]),
+}
+
+
+def check_config():
+    """Stoppar direkt med ett begripligt meddelande om .env är fel ifylld."""
+    if BACKEND not in BACKENDS:
+        sys.exit(f"❌ Okänd SEARCH_BACKEND '{BACKEND}'. "
+                 f"Tillåtna värden: {', '.join(BACKENDS)}.")
+    search, required = BACKENDS[BACKEND]
+    missing = [k for k in required if not os.getenv(k, "").strip()]
+    if missing:
+        sys.exit(f"❌ Saknar {', '.join(missing)} i .env-filen "
+                 f"(kopiera env.example till .env och fyll i nyckeln).")
+    return search
 
 
 def is_relevant(item: dict) -> bool:
-    if not MUST_CONTAIN_ANY:
+    if not RELEVANT_RE:
         return True
-    text = f"{item['title']} {item['snippet']}".lower()
-    return any(w in text for w in MUST_CONTAIN_ANY)
+    text = f"{item['title']} {item['snippet']}"
+    return any(p.search(text) for p in RELEVANT_RE)
 
 
-def main() -> None:
+def collect(search, rows: list[dict]) -> None:
+    """Fyller på rows under körningen, så att inget går förlorat vid avbrott."""
     keyword_block = " OR ".join(f'"{k}"' for k in KEYWORDS)
     seen_urls: set[str] = set()
-    rows: list[dict] = []
 
     for platform, site_filter in PLATFORMS.items():
         query = f"{site_filter} ({keyword_block})"
         print(f"\n🔎 {platform}: {query}")
         for page in range(1, PAGES_PER_QUERY + 1):
             try:
-                results = SEARCH(query, page)
-            except requests.HTTPError as e:
-                print(f"   ⚠️  errore pagina {page}: {e}")
+                results = search(query, page)
+            except requests.RequestException as e:
+                # Nätverksfel eller API-fel: hoppa till nästa plattform,
+                # men behåll allt som redan har samlats in.
+                print(f"   ⚠️  fel på sida {page}: {e}")
                 break
             if not results:
                 break
@@ -128,29 +163,27 @@ def main() -> None:
                              "URL": r["url"], "Snippet": r["snippet"],
                              "Date": r["date"]})
                 new += 1
-            print(f"   pagina {page}: {len(results)} risultati, {new} nuovi")
-            time.sleep(1)  # gentile con l'API
+            print(f"   sida {page}: {len(results)} resultat, {new} nya")
+            time.sleep(1)  # var snäll mot API:et
 
-    if not rows:
-        print("\nNessun risultato trovato.")
-        return
 
+def export(rows: list[dict]) -> None:
     stamp = datetime.now().strftime("%Y-%m-%d")
     os.makedirs("output", exist_ok=True)
     cols = ["Platform", "Title", "URL", "Snippet", "Date"]
 
-    # CSV (utf-8-sig così Excel legge bene å ä ö)
+    # CSV (utf-8-sig så att Excel visar å ä ö korrekt)
     csv_path = f"output/social_media_inlagg_{stamp}.csv"
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
         w.writerows(rows)
 
-    # Excel (si può importare direttamente in Google Sheets)
+    # Excel (kan importeras direkt i Google Kalkylark)
     xlsx_path = f"output/social_media_inlagg_{stamp}.xlsx"
     wb = Workbook()
     ws = wb.active
-    ws.title = "Risultati"
+    ws.title = "Resultat"
     ws.append(cols)
     for c in ws[1]:
         c.font = Font(bold=True)
@@ -164,7 +197,20 @@ def main() -> None:
     ws.freeze_panes = "A2"
     wb.save(xlsx_path)
 
-    print(f"\n✅ {len(rows)} risultati salvati in:\n   {csv_path}\n   {xlsx_path}")
+    print(f"\n✅ {len(rows)} resultat sparade i:\n   {csv_path}\n   {xlsx_path}")
+
+
+def main() -> None:
+    search = check_config()
+    rows: list[dict] = []
+    try:
+        collect(search, rows)
+    except KeyboardInterrupt:
+        print("\n⏹  Avbruten – sparar det som hunnit samlas in.")
+    if not rows:
+        print("\nInga resultat hittades.")
+        return
+    export(rows)
 
 
 if __name__ == "__main__":
